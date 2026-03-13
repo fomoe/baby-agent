@@ -5,7 +5,9 @@ description = "A smart command-line agent with OpenAI integration"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "openai>=1.0.0"
+    "openai>=1.0.0",
+    "textual>=0.52.0",
+    "rich>=13.0.0"
 ]
 
 [project.scripts]
