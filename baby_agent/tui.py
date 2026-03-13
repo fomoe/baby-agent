@@ -20,6 +20,7 @@ from textual.widgets import (
     Tree,
 )
 from textual.reactive import reactive
+from textual.worker import Worker
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -31,16 +32,18 @@ from baby_agent.agent import BabyAgent
 class MessageDisplay(Static):
     """消息显示组件"""
 
-    def __init__(self, role: str, content: str, **kwargs):
+    def __init__(self, role: str, content: str = "", **kwargs):
         self.role = role
         self.message_content = content
         super().__init__(**kwargs)
+        self.add_class(f"{role}-message")
 
     def compose(self) -> ComposeResult:
         if self.role == "user":
             yield Label(Text(f"You: {self.message_content}", style="bold cyan"))
         elif self.role == "assistant":
-            yield Label(Text(f"Agent: {self.message_content}", style="bold green"))
+            self.assistant_label = Label(Text(f"Agent: {self.message_content}", style="bold green"))
+            yield self.assistant_label
         elif self.role == "tool_call":
             yield Label(Text(f"🔧 Tool Call: {self.message_content}", style="bold yellow"))
         elif self.role == "tool_result":
@@ -49,6 +52,35 @@ class MessageDisplay(Static):
             yield Label(Text(f"ℹ️  {self.message_content}", style="italic dim"))
         elif self.role == "error":
             yield Label(Text(f"❌ Error: {self.message_content}", style="bold red"))
+
+    def update_content(self, content: str):
+        """更新消息内容（用于流式输出）"""
+        self.message_content = content
+        if self.role == "assistant" and hasattr(self, 'assistant_label'):
+            self.assistant_label.update(Text(f"Agent: {content}", style="bold green"))
+
+
+class StreamingMessageDisplay(Static):
+    """支持流式输出的消息显示组件"""
+
+    def __init__(self, **kwargs):
+        self.message_content = ""
+        super().__init__(**kwargs)
+        self.add_class("agent-message")
+
+    def compose(self) -> ComposeResult:
+        self.label = Label(Text("Agent: ", style="bold green"))
+        yield self.label
+
+    def append_text(self, text: str):
+        """追加文本内容"""
+        self.message_content += text
+        self.label.update(Text(f"Agent: {self.message_content}", style="bold green"))
+
+    def set_content(self, content: str):
+        """设置完整内容"""
+        self.message_content = content
+        self.label.update(Text(f"Agent: {content}", style="bold green"))
 
 
 class BabyAgentTUI(App):
@@ -301,7 +333,7 @@ class BabyAgentTUI(App):
             chat_history.mount(MessageDisplay("system", "Plan mode commands: add task <task>, list tasks, execute plan"))
 
     async def process_react_mode(self, message: str, chat_history: VerticalScroll):
-        """处理 ReACT 模式（带 tool call）"""
+        """处理 ReACT 模式（带 tool call），支持流式输出"""
         if not self.agent.openai_client:
             chat_history.mount(MessageDisplay("error", "OpenAI client not initialized. Please set OPENAI_API_KEY."))
             return
@@ -326,72 +358,145 @@ After receiving tool results, provide a helpful response to the user."""
         ]
 
         try:
-            # 第一次调用，获取 tool calls
-            response = self.agent.openai_client.chat_completion(
+            # 使用流式 API 处理整个对话
+            await self._stream_with_tools(messages, chat_history)
+        except Exception as e:
+            chat_history.mount(MessageDisplay("error", f"Error: {e}"))
+
+    async def _stream_with_tools(self, messages: list, chat_history: VerticalScroll):
+        """流式处理对话，支持 tool calls"""
+        import json
+
+        # 创建流式显示组件
+        streaming_display = StreamingMessageDisplay()
+        await chat_history.mount(streaming_display)
+
+        # 用于收集完整响应
+        full_content = ""
+        tool_calls_data = []
+        current_tool_call = None
+        has_tool_calls = False
+
+        # 第一次流式调用
+        stream = self.agent.openai_client.stream_chat_completion(
+            messages=messages,
+            tools=self.agent.all_tools_schema
+        )
+
+        for chunk in stream:
+            if hasattr(chunk, 'choices') and chunk.choices:
+                delta = chunk.choices[0].delta
+
+                # 处理普通内容
+                if hasattr(delta, 'content') and delta.content:
+                    content = delta.content
+                    full_content += content
+                    streaming_display.append_text(content)
+                    await asyncio.sleep(0.001)
+
+                # 处理 tool calls
+                if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                    has_tool_calls = True
+                    for tc in delta.tool_calls:
+                        if tc.index is not None:
+                            # 确保列表足够长
+                            while len(tool_calls_data) <= tc.index:
+                                tool_calls_data.append({"id": "", "function": {"name": "", "arguments": ""}})
+
+                            current_tool_call = tool_calls_data[tc.index]
+
+                            if tc.id:
+                                current_tool_call["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                current_tool_call["function"]["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                current_tool_call["function"]["arguments"] += tc.function.arguments
+
+        # 如果有 tool calls，执行它们并继续流式输出
+        if has_tool_calls and tool_calls_data:
+            # 清除流式显示（因为 tool call 不需要流式显示）
+            streaming_display.set_content("(使用工具中...)")
+
+            # 显示 tool calls
+            for tc in tool_calls_data:
+                func_name = tc["function"]["name"]
+                func_args = tc["function"]["arguments"]
+                chat_history.mount(MessageDisplay("tool_call", f"{func_name}({func_args})"))
+
+            # 添加助手消息到历史
+            messages.append({
+                "role": "assistant",
+                "content": full_content,
+                "tool_calls": [{
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"]
+                    }
+                } for tc in tool_calls_data]
+            })
+
+            # 执行工具调用
+            for tc in tool_calls_data:
+                function_name = tc["function"]["name"]
+                try:
+                    function_args = json.loads(tc["function"]["arguments"])
+                except json.JSONDecodeError:
+                    function_args = {}
+
+                # 执行工具
+                if function_name in self.agent.tool_executors:
+                    result = self.agent.tool_executors[function_name](function_name, function_args)
+                else:
+                    result = f"Error: Tool '{function_name}' not found"
+
+                chat_history.mount(MessageDisplay("tool_result", str(result)))
+
+                # 添加工具结果到消息历史
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": str(result)
+                })
+
+            # 移除临时的"使用工具中..."消息，创建新的流式显示
+            await streaming_display.remove()
+            await self._stream_response(messages, chat_history)
+        else:
+            # 没有 tool calls，流式输出已经完成
+            pass
+
+    async def _stream_response(self, messages: list, chat_history: VerticalScroll):
+        """流式输出 AI 响应（第二次调用，在 tool call 之后）"""
+        # 创建流式显示组件
+        streaming_display = StreamingMessageDisplay()
+        await chat_history.mount(streaming_display)
+
+        try:
+            # 使用流式 API
+            stream = self.agent.openai_client.stream_chat_completion(
                 messages=messages,
                 tools=self.agent.all_tools_schema
             )
-            msg = response.choices[0].message
 
-            # 检查是否有 tool calls
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                # 显示 tool calls
-                for tool_call in msg.tool_calls:
-                    import json
-                    func_name = tool_call.function.name
-                    func_args = tool_call.function.arguments
-                    chat_history.mount(MessageDisplay("tool_call", f"{func_name}({func_args})"))
+            full_content = ""
+            for chunk in stream:
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, 'content') and delta.content:
+                        content = delta.content
+                        full_content += content
+                        streaming_display.append_text(content)
+                        # 小延迟让 UI 有更新的机会
+                        await asyncio.sleep(0.001)
 
-                # 添加助手消息到历史
-                messages.append({
-                    "role": "assistant",
-                    "content": msg.content or "",
-                    "tool_calls": [{
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    } for tc in msg.tool_calls]
-                })
-
-                # 执行工具调用
-                for tool_call in msg.tool_calls:
-                    import json
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
-
-                    # 执行工具
-                    if function_name in self.agent.tool_executors:
-                        result = self.agent.tool_executors[function_name](function_name, function_args)
-                    else:
-                        result = f"Error: Tool '{function_name}' not found"
-
-                    chat_history.mount(MessageDisplay("tool_result", str(result)))
-
-                    # 添加工具结果到消息历史
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": str(result)
-                    })
-
-                # 第二次调用，获取最终响应
-                final_response = self.agent.openai_client.chat_completion(
-                    messages=messages,
-                    tools=self.agent.all_tools_schema
-                )
-                final_content = final_response.choices[0].message.content
-                if final_content:
-                    chat_history.mount(MessageDisplay("assistant", final_content))
-            else:
-                # 没有 tool calls，直接显示响应
-                if msg.content:
-                    chat_history.mount(MessageDisplay("assistant", msg.content))
+            # 如果没有获取到任何内容，显示提示
+            if not full_content:
+                streaming_display.set_content("(No response)")
 
         except Exception as e:
-            chat_history.mount(MessageDisplay("error", f"Error: {e}"))
+            streaming_display.set_content(f"Error during streaming: {e}")
 
 
 def main():
