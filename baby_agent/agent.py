@@ -4,11 +4,12 @@ from typing import Optional, Dict, Any
 from baby_agent.utils.openai_client import OpenAIClient
 
 class BabyAgent:
-    def __init__(self):
+    def __init__(self, model="openrouter/hunter-alpha"):
         self.mode = "react"  # 默认模式为ReACT模式
         self.tools = {}
         self.skills = {}
         self.openai_client = None
+        self.model = model
         self.initialize_tools()
         self.initialize_skills()
         self.initialize_openai()
@@ -26,8 +27,8 @@ class BabyAgent:
     
     def initialize_openai(self):
         try:
-            self.openai_client = OpenAIClient()
-            print("OpenAI client initialized successfully")
+            self.openai_client = OpenAIClient(model=self.model)
+            print(f"OpenAI client initialized successfully with model: {self.model}")
         except Exception as e:
             print(f"Warning: Failed to initialize OpenAI client: {e}")
             print("Continuing without OpenAI integration")
@@ -164,8 +165,10 @@ class BabyAgent:
                     if result['stderr']:
                         print(f"[Observation]: stderr: {result['stderr']}")
             
-            # 3. 生成最终响应
-            final_response = self.openai_client.generate_response(f"Based on the reasoning and observations, provide a final response to the user: {user_input}")
-            print(f"Baby Agent: {final_response}")
+            # 3. 生成最终响应（使用流式）
+            print("Baby Agent: ", end="", flush=True)
+            for chunk in self.openai_client.stream_generate_response(f"Based on the reasoning and observations, provide a final response to the user: {user_input}"):
+                print(chunk, end="", flush=True)
+            print()
         else:
             print("Baby Agent: OpenAI integration is not available. Please set OPENAI_API_KEY environment variable.")

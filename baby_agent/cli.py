@@ -1,10 +1,15 @@
 import sys
+import argparse
 from baby_agent.agent import BabyAgent
 
 def main():
     """Main entry point for the baby-agent command"""
+    parser = argparse.ArgumentParser(description="Baby Agent - A smart command-line agent with OpenAI integration")
+    parser.add_argument('-m', '--model', type=str, default="openrouter/hunter-alpha", help="Set the OpenAI model to use")
+    args = parser.parse_args()
+    
     try:
-        agent = BabyAgent()
+        agent = BabyAgent(model=args.model)
         agent.run()
     except KeyboardInterrupt:
         print("\nGoodbye!")
